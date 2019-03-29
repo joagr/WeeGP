@@ -1,5 +1,5 @@
 [package]
-name = "r02"
+name = "tiny_gp"
 version = "0.1.0"
 authors = ["joagr <john@joanju.com>"]
 edition = "2018"
