@@ -1,41 +1,38 @@
 /*
-    A Rust implementation of Riccardo Poli's TinyGP:
+    WeeGP
+
+    Variations on Riccardo Poli's TinyGP:
         https://cswww.essex.ac.uk/staff/rpoli/TinyGP/
-    closely based on his Java version from here:
         https://cswww.essex.ac.uk/staff/rpoli/TinyGP/tiny_gp.java
 
     March 2019 by John Green (john@joanju.com)
 
-    This closely follows Riccardo's java code, so that this rust version
-    can easily be compared with the java version. I intend to do some variation
-    on this, but as a separate fork.
 */
-
-
-// Allow names to be the same as they were in Riccardo's java version
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
 
 
 use rand::prelude::*;
 use std::error::Error;
 use std::io::prelude::*;
 use std::str::FromStr;
+use std::time::Instant;
 
-
-const ADD: u8 = 110;
-const SUB: u8 = 111; 
-const MUL: u8 = 112; 
-const DIV: u8 = 113;
+const ADD: u8 = 200;
+const SUB: u8 = 201; 
+const MUL: u8 = 202; 
+const DIV: u8 = 203;
 const FSET_START: u8 = ADD; 
 const FSET_END: u8 = DIV;
-const MAX_LEN: usize = 10_000;
-const POPSIZE: usize = 100_000;
-const DEPTH: usize = 5;
-const GENERATIONS: usize = 100;
-const TSIZE: usize = 2;
+const MAX_LEN: usize = 40;
+const POPSIZE: usize = 1_000_000;
+const INITIAL_EXPRESSION_DEPTH: usize = 5;
+const GENERATIONS: usize = 2000;
+const TOURNAMENT_SIZE: usize = 2;
 const PMUT_PER_NODE: f64 = 0.05;
 const CROSSOVER_PROB: f64 = 0.9;
+const PRINT_FREQUENCY: usize = 2;
+// For tournaments, if two competitors fitness are within this percent of
+// each other, give preference to the smaller competitor.
+const CONSIDERED_CLOSE: f64 = 0.01;
 
 
 fn main() {
@@ -48,14 +45,14 @@ fn main() {
                 println!("Error parsing args: First arg must be a non-negative integer");
                 return;
             },
-            Ok(i) => {seed = i as i64}
+            Ok(value) => {seed = i64::from(value)}
         }
         filename = &args[1];
     }
     else if args.len() == 1 {
         filename = &args[0];
     }
-    let mut gp = tiny_gp::new(seed, filename);
+    let mut gp = WeeGP::new(seed, filename);
     if let Err(err) = gp.setup() {
         println!("{}", err);
         return;
@@ -64,40 +61,42 @@ fn main() {
 }
 
 
-struct tiny_gp {
+struct WeeGP {
     favgpop: f64,
     fbestpop: f64,
     filename: String,
     fitness: Vec<f64>,
-    maxrandom: f64,
-    minrandom: f64,
-    PC: usize,
+    fitnesscases: u8,
+    pc: usize,
     pop: Vec<Vec<u8>>,
     rd: StdRng,
     seed: i64,
+    starttime: std::time::Instant,
     targets: Vec<Vec<f64>>,
-    x: [f64; FSET_START as usize],
-    varnumber: u8, fitnesscases: u8, randomnumber: u8,
+    x: Vec<f64>,
+    x_names: Vec<String>,
+    varnumber: u8,
 }
 
 
-impl tiny_gp {
+impl WeeGP {
 
-    pub fn new(seed: i64, filename: &str) -> tiny_gp {
-        tiny_gp {
+    pub fn new(seed: i64, filename: &str) -> WeeGP {
+        WeeGP {
             favgpop: 0.0,
             fbestpop: 0.0,
             filename: filename.to_string(),
             fitness: vec![0.0; POPSIZE],
-            maxrandom: 0.0,
-            minrandom: 0.0,
-            PC: 0,
+            fitnesscases: 0,
+            pc: 0,
             pop: Vec::new(),
             rd: StdRng::from_entropy(),
             seed: seed,
+            starttime: Instant::now(),
             targets: Vec::new(),
-            x: [0.0; FSET_START as usize],
-            varnumber: 0, fitnesscases: 0, randomnumber: 0,
+            x: Vec::new(),
+            x_names: Vec::new(),
+            varnumber: 0,
         }
     }
 
@@ -105,20 +104,66 @@ impl tiny_gp {
         if self.seed >= 0 {
             self.rd = SeedableRng::seed_from_u64(self.seed as u64);
         }
-        self.setup_fitness()?;
-        for i in 0..FSET_START as usize {
-            self.x[i] =
-                (self.maxrandom - self.minrandom) * self.rd.gen::<f64>()
-                + self.minrandom;
+        self.setup_fitness()?;  // Loads the parameters
+        self.setup_x();  // Uses parameter values to configure the x vector
+        if self.x.len() >= FSET_START as usize {
+            return Err("Too many independent variables".into());
         }
-        self.pop = self.create_random_pop(POPSIZE, DEPTH);
+        self.pop = self.create_random_pop(POPSIZE, INITIAL_EXPRESSION_DEPTH);
         Ok(())
+    }
+
+    fn setup_fitness(&mut self) -> Result<(), Box<Error>> {
+        let file = std::fs::File::open(&self.filename)?;
+        let reader = std::io::BufReader::new(file);
+        let mut line_iter = reader.lines();
+        let errmsg = "Invalid data file";
+        let mut line = line_iter.next().ok_or(errmsg)??;
+        let mut token_iter = line.split_whitespace();
+        self.varnumber = u8::from_str(token_iter.next().ok_or(errmsg)?)?;
+        token_iter.next().ok_or(errmsg)?; // tinyGP 'randomnumber', not used here
+        token_iter.next().ok_or(errmsg)?; // tinyGP 'minrandom', not used here
+        token_iter.next().ok_or(errmsg)?; // tinyGP 'maxrandom', not used here
+        self.fitnesscases = u8::from_str(token_iter.next().ok_or(errmsg)?)?;
+        self.targets = Vec::new();
+        for _ in 0..self.fitnesscases {
+            line = line_iter.next().ok_or(errmsg)??;
+            let mut token_iter = line.split_whitespace();
+            let mut v = Vec::new();
+            for _ in 0..=self.varnumber {
+                let val = f64::from_str(token_iter.next().ok_or(errmsg)?)?;
+                v.push(val);
+            }
+            self.targets.push(v);
+        }
+        Ok(())
+    }
+
+    fn setup_x(&mut self) {
+        // Add one slot for each independent variable from our input
+        for n in 0..self.varnumber as usize {
+            self.add_x(0.0, &format!("X{}", n));
+        }
+        // Now add some f64 constants
+        self.add_x(-1.0, "-1");
+        for n in 1..=10 {
+            self.add_x(f64::from(n), &format!("{}", n));
+        }
+        self.add_x(100_f64, "100");
+        self.add_x(1000_f64, "1000");
+        self.add_x(std::f64::consts::PI, "pi");
+        self.add_x(std::f64::consts::E, "e");
+    }
+
+    fn add_x(&mut self, value: f64, name: &str) {
+            self.x.push(value);
+            self.x_names.push(name.to_string());
     }
 
     // The interpreter
     fn run(&mut self, program: &[u8]) -> f64 {
-        let primitive = program[self.PC];
-        self.PC += 1;
+        let primitive = program[self.pc];
+        self.pc += 1;
         if primitive < FSET_START {
             return self.x[primitive as usize];
         }
@@ -134,96 +179,237 @@ impl tiny_gp {
                 }
                 num / den
             }
-            _ => 0.0  // should never get here
+            _ => panic!("Unexpected token during Run")
         }
     }
 
-    fn traverse(&self, buffer: &[u8], buffercount: usize) -> usize {
+    fn expression_length(&self, buffer: &[u8], buffercount: usize) -> usize {
         if buffer[buffercount] < FSET_START {
             return buffercount + 1;
         }
         match buffer[buffercount] {
             ADD | SUB | MUL | DIV =>
-                self.traverse(buffer, self.traverse(buffer, buffercount + 1)),
-            _ => 0 // should never get here
+                self.expression_length(buffer, self.expression_length(buffer, buffercount + 1)),
+            _ => panic!("Unexpected token while calculating expression length")
         }
     }
 
-    fn setup_fitness(&mut self) -> Result<(), Box<Error>> {
-        let file = std::fs::File::open(&self.filename)?;
-        let reader = std::io::BufReader::new(file);
-        let mut line_iter = reader.lines();
-        let errmsg = "Invalid data file";
-        let mut line = line_iter.next().ok_or(errmsg)??;
-        let mut token_iter = line.split_whitespace();
-        self.varnumber = u8::from_str(token_iter.next().ok_or(errmsg)?)?;
-        self.randomnumber = u8::from_str(token_iter.next().ok_or(errmsg)?)?;
-        self.minrandom = f64::from_str(token_iter.next().ok_or(errmsg)?)?;
-        self.maxrandom = f64::from_str(token_iter.next().ok_or(errmsg)?)?;
-        self.fitnesscases = u8::from_str(token_iter.next().ok_or(errmsg)?)?;
-        if self.varnumber + self.randomnumber >= FSET_START {
-            return Err("too many variables and constants".into());
-        }
-        self.targets = Vec::new();
-        for _ in 0..self.fitnesscases {
-            line = line_iter.next().ok_or(errmsg)??;
-            let mut token_iter = line.split_whitespace();
-            let mut v = Vec::new();
-            for _ in 0..=self.varnumber {
-                let val = f64::from_str(token_iter.next().ok_or(errmsg)?)?;
-                v.push(val);
-            }
-            self.targets.push(v);
-        }
-        Ok(())
-    }
-
-    fn fitness_function(&mut self, Prog: &Vec<u8>) -> f64 {
+    fn fitness_function(&mut self, prog: &[u8]) -> f64 {
         let mut fit: f64 = 0.0;
-        self.traverse(Prog, 0);
         let varnum = self.varnumber as usize;
         for i in 0..self.fitnesscases as usize {
             self.x[..varnum].clone_from_slice(&self.targets[i][..varnum]);
-            self.PC = 0;
-            let result = self.run(Prog);
+            self.pc = 0;
+            let result = self.run(prog);
             fit += (result - self.targets[i][varnum]).abs();
         }
         -fit
     }
 
-    fn grow(&mut self, buffer: &mut Vec<u8>, pos: usize, max: usize, depth: usize) -> isize {
-        if pos >= max {
+    fn random_operator(&mut self) -> u8 {
+        self.rd.gen_range(0, FSET_END - FSET_START + 1) + FSET_START
+    }
+
+    fn random_x_index(&mut self) -> u8 {
+        // 1/3 of the time...
+        if self.rd.gen_range(0, 3) == 0 {
+            // Return an index to an independent variable
+            self.rd.gen_range(0, self.varnumber) as u8
+        } else {
+            // Return an index to an f64 constant
+            self.rd.gen_range(self.varnumber, self.x.len() as u8)
+        }
+    }
+
+    fn grow(&mut self, buffer: &mut Vec<u8>, pos: usize, depth: usize) -> isize {
+        if pos >= MAX_LEN {
             return -1;
         }
         let mut prim: u8 = if pos == 0 { 1 } else { self.rd.gen_range(0, 2) };
         if prim == 0 || depth == 0 {
-            prim = self.rd.gen_range(0, self.varnumber + self.randomnumber);
+            prim = self.random_x_index();
             buffer[pos] = prim;
             pos as isize + 1
         }
         else  {
-            prim = self.rd.gen_range(0, FSET_END - FSET_START + 1) + FSET_START;
+            prim = self.random_operator();
             match prim {
                 ADD | SUB | MUL | DIV => {},
                 _ => { return 0; }  // should never get here
             }
             buffer[pos] = prim;
-            let one_child = self.grow(buffer, pos + 1, max, depth - 1);
+            let one_child = self.grow(buffer, pos + 1, depth - 1);
             if one_child < 0 {
                 return -1;
             }
-            self.grow(buffer, one_child as usize, max, depth - 1)
+            self.grow(buffer, one_child as usize, depth - 1)
         }
+    }
+
+    fn create_random_indiv(&mut self, depth: usize) -> Vec<u8> {
+        let mut ind: Vec<u8> = vec![0; MAX_LEN];
+        let mut len = self.grow(&mut ind, 0, depth);
+        while len < 0 {
+            len = self.grow(&mut ind, 0, depth);
+        }
+        ind.truncate(len as usize);
+        ind.shrink_to_fit();
+        ind
+    }
+
+    fn create_random_pop(&mut self, n: usize, depth: usize) -> Vec<Vec<u8>> {
+        let mut pop: Vec<Vec<u8>> = Vec::new();
+        for i in 0..n {
+            pop.push(self.create_random_indiv(depth));
+            self.fitness[i] = self.fitness_function(&pop[i]);
+        }
+        pop
+    }
+
+    // Returns 'best' competitor: less than 0 for left, 0 for same, greather than 0 for right.
+    fn compare(&self, left: usize, right: usize) -> f64 {
+        let fit_left = self.fitness[left];
+        let fit_right = self.fitness[right];
+        let average = (fit_left + fit_right) / 2.0;
+        // Get a positive difference here if right has better fit than left
+        let difference = fit_right - fit_left;
+        let mut comparison_result = difference;
+        let are_close = (difference / average).abs() * 100.0 <= CONSIDERED_CLOSE;
+        if are_close {
+            let len_left = self.pop[left].len();
+            let len_right = self.pop[right].len();
+            if len_left != len_right
+                // Get a positive difference here if right is shorter than left
+                { comparison_result = (len_left - len_right) as f64; }
+        }
+        comparison_result
+    }
+
+    fn tournament(&mut self, tsize: usize) -> usize {
+        let mut best = self.rd.gen_range(0, POPSIZE);
+        for _ in 1..tsize {
+            let competitor = self.rd.gen_range(0, POPSIZE);
+            if self.compare(best, competitor) > 0.0
+                { best = competitor; }
+        }
+        best
+    }
+
+    fn negative_tournament(&mut self, tsize: usize) -> usize {
+        let mut worst = self.rd.gen_range(0, POPSIZE);
+        for _ in 1..tsize {
+            let competitor = self.rd.gen_range(0, POPSIZE);
+            if self.compare(worst, competitor) < 0.0
+                { worst = competitor; }
+        }
+        worst
+    }
+
+    fn crossover(&mut self, parent1_index: usize, parent2_index: usize) -> Vec<u8> {
+        let parent1 = &self.pop[parent1_index];
+        let parent2 = &self.pop[parent2_index];
+        let len1 = parent1.len();
+        let len2 = parent2.len();
+        let xo1start = self.rd.gen_range(0, len1);
+        let xo1end = self.expression_length(&parent1, xo1start);
+        let xo2start = self.rd.gen_range(0, len2);
+        let xo2end = self.expression_length(&parent2, xo2start);
+        let mut offspring = (&parent1[0..xo1start]).to_vec();
+        offspring.extend((&parent2[xo2start..xo2end]).iter());
+        offspring.extend((&parent1[xo1end..len1]).iter());
+        let mut offspring_expr_len = self.expression_length(&offspring, 0);
+        if offspring_expr_len > MAX_LEN {
+            // It's too long. Truncate from the front.
+            let overflow = offspring_expr_len - MAX_LEN;
+            offspring = offspring[overflow..].to_vec();
+            offspring_expr_len = self.expression_length(&offspring, 0);
+        }
+        offspring.truncate(offspring_expr_len as usize);
+        offspring.shrink_to_fit();
+        offspring
+    }
+
+    fn mutation(&mut self, parent_index: usize, pmut: f64) -> Vec<u8> {
+        let parent = &self.pop[parent_index];
+        let len = parent.len();
+        let mut parentcopy = parent.clone();
+        for i in 0..len {
+            if self.rd.gen::<f64>() < pmut {
+                let mutsite = i;
+                if parentcopy[mutsite] < FSET_START {
+                    parentcopy[mutsite] = self.random_x_index();
+                }
+                else {
+                    match parentcopy[mutsite] {
+                        ADD | SUB | MUL | DIV => {
+                            parentcopy[mutsite] = self.random_operator();
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+        parentcopy
+    }
+
+    pub fn evolve(&mut self) {
+        let mut offspring;
+        let mut parent1;
+        let mut parent2;
+        let mut parent;
+        let mut newfit;
+        let mut newind;
+        self.print_parms();
+        self.stats(0);
+        for gen in 1..GENERATIONS {
+            if self.fbestpop > -1e-5 {
+                println!("Reached fitness better than 1e-5");
+                self.print_parms();
+                std::process::exit(0);
+            }
+            for _ in 0..POPSIZE {
+                if self.rd.gen::<f64>() < CROSSOVER_PROB {
+                    parent1 = self.tournament(TOURNAMENT_SIZE);
+                    parent2 = self.tournament(TOURNAMENT_SIZE);
+                    newind = self.crossover(parent1, parent2);
+                } else {
+                    parent = self.tournament(TOURNAMENT_SIZE);
+                    newind = self.mutation(parent, PMUT_PER_NODE);
+                }
+                newfit = self.fitness_function(&newind);
+                offspring = self.negative_tournament(TOURNAMENT_SIZE);
+                self.pop[offspring] = newind;
+                self.fitness[offspring] = newfit;
+            }
+            if gen % PRINT_FREQUENCY == 0 {
+                self.stats(gen);
+            }
+        }
+        println!("Reached maximum number of generations");
+        self.print_parms();
+    }
+
+    fn print_parms(&self) {
+        println!("\
+            -- TINY GP (Rust implementation) -- \n\
+            SEED={} \n\
+            MAX_LEN={} \n\
+            POPSIZE={} \n\
+            DEPTH={} \n\
+            CROSSOVER_PROB={} \n\
+            PMUT_PER_NODE={} \n\
+            GENERATIONS={} \n\
+            TSIZE={} \n\
+            ----------------------------------",
+            self.seed, MAX_LEN, POPSIZE, INITIAL_EXPRESSION_DEPTH, CROSSOVER_PROB, PMUT_PER_NODE,
+            GENERATIONS, TOURNAMENT_SIZE
+            );
     }
 
     fn print_indiv(&self, buffer: &[u8], buffercounter: usize) -> usize {
         let mut a1: usize = 0;
         if buffer[buffercounter] < FSET_START {
-            if buffer[buffercounter] < self.varnumber {
-                print!("X{} ", buffer[buffercounter] + 1);
-            } else {
-                print!("{}", &self.x[buffer[buffercounter] as usize]);
-            }
+            print!("{}", &self.x_names[buffer[buffercounter] as usize]);
             return buffercounter + 1;
         }
         match buffer[buffercounter] {
@@ -254,34 +440,18 @@ impl tiny_gp {
         a2
     }
 
-    fn create_random_indiv(&mut self, depth: usize) -> Vec<u8> {
-        let mut ind: Vec<u8> = vec![0; MAX_LEN];
-        let mut len = self.grow(&mut ind, 0, MAX_LEN, depth);
-        while len < 0 {
-            len = self.grow(&mut ind, 0, MAX_LEN, depth);
-        }
-        ind
-    }
-
-    fn create_random_pop(&mut self, n: usize, depth: usize) -> Vec<Vec<u8>> {
-        let mut pop: Vec<Vec<u8>> = Vec::new();
-        for i in 0..n {
-            pop.push(self.create_random_indiv(depth));
-            self.fitness[i] = self.fitness_function(&pop[i]);
-        }
-        pop
-    }
-
     fn stats(&mut self, gen: usize) {
         let mut best = self.rd.gen_range(0, POPSIZE);
+        let mut best_size = 0;
         let mut node_count: usize = 0;
         self.fbestpop = self.fitness[best];
         self.favgpop = 0.0;
         for i in 0..POPSIZE {
-            node_count += self.traverse(&self.pop[i], 0);
+            node_count += self.pop[i].len();
             self.favgpop += self.fitness[i];
             if self.fitness[i] > self.fbestpop {
                 best = i;
+                best_size = self.pop[i].len();
                 self.fbestpop = self.fitness[i];
             }
         }
@@ -289,135 +459,19 @@ impl tiny_gp {
         let avg_len = (node_count as f64) / fpopsize;
         self.favgpop /= fpopsize;
         print!("\
+            {}secs \
             Generation={} \
-            Avg Fitness={} \
-            Best Fitness={} \
-            Avg Size={} \n\
+            Avg Fitness={:.2} \
+            Best Fitness={:.6} \
+            Avg Size={:.2} \
+            Best Size={} \n\
             Best Individual: ",
-            gen, -self.favgpop, -self.fbestpop, avg_len
+            self.starttime.elapsed().as_secs(),
+            gen, -self.favgpop, -self.fbestpop, avg_len, best_size,
             );
         let buffer = &self.pop[best];
         self.print_indiv(buffer, 0);
         println!();
-    }
-
-    fn tournament(&mut self, tsize: usize) -> usize {
-        let mut best = self.rd.gen_range(0, POPSIZE);
-        let mut fbest: f64 = -1.0e34;
-        for _ in 0..tsize {
-            let competitor = self.rd.gen_range(0, POPSIZE);
-            if self.fitness[competitor] > fbest {
-                fbest = self.fitness[competitor];
-                best = competitor;
-            }
-        }
-        best
-    }
-
-    fn negative_tournament(&mut self, tsize: usize) -> usize {
-        let mut worst = self.rd.gen_range(0, POPSIZE);
-        let mut fworst: f64 = 1e34;
-        for _ in 0..tsize {
-            let competitor = self.rd.gen_range(0, POPSIZE);
-            if self.fitness[competitor] < fworst {
-                fworst = self.fitness[competitor];
-                worst = competitor;
-            }
-        }
-        worst
-    }
-
-    fn crossover(&mut self, parent1Index: usize, parent2Index: usize) -> Vec<u8> {
-        let parent1 = &self.pop[parent1Index];
-        let parent2 = &self.pop[parent2Index];
-        let len1 = self.traverse(&parent1, 0);
-        let len2 = self.traverse(&parent2, 0);
-        let xo1start = self.rd.gen_range(0, len1);
-        let xo1end = self.traverse(&parent1, xo1start);
-        let xo2start = self.rd.gen_range(0, len2);
-        let xo2end = self.traverse(&parent2, xo2start);
-        let mut offspring = (&parent1[0..xo1start]).to_vec();
-        offspring.extend((&parent2[xo2start..xo2end]).iter());
-        offspring.extend((&parent1[xo1end..len1]).iter());
-        offspring
-    }
-
-    fn mutation(&mut self, parentIndex: usize, pmut: f64) -> Vec<u8> {
-        let parent = &self.pop[parentIndex];
-        let len = self.traverse(&parent, 0);
-        let mut parentcopy = parent.clone();
-        for i in 0..len {
-            if self.rd.gen::<f64>() < pmut {
-                let mutsite = i;
-                if parentcopy[mutsite] < FSET_START {
-                    parentcopy[mutsite] =
-                        self.rd.gen_range(0, self.varnumber + self.randomnumber);
-                }
-                else {
-                    match parentcopy[mutsite] {
-                        ADD | SUB | MUL | DIV => {
-                            parentcopy[mutsite] =
-                                self.rd.gen_range(0, FSET_END - FSET_START + 1) + FSET_START;
-                        },
-                        _ => {}
-                    }
-                }
-            }
-        }
-        parentcopy
-    }
-
-    fn print_parms(&self) {
-        println!("\
-            -- TINY GP (Rust implementation) -- \n\
-            SEED={} \n\
-            MAX_LEN={} \n\
-            POPSIZE={} \n\
-            DEPTH={} \n\
-            CROSSOVER_PROB={} \n\
-            PMUT_PER_NODE={} \n\
-            MIN_RANDOM={} \n\
-            MAX_RANDOM={} \n\
-            GENERATIONS={} \n\
-            TSIZE={} \n\
-            ----------------------------------",
-            self.seed, MAX_LEN, POPSIZE, DEPTH, CROSSOVER_PROB, PMUT_PER_NODE,
-            self.minrandom, self.maxrandom, GENERATIONS, TSIZE
-            );
-    }
-
-    pub fn evolve(&mut self) {
-        let mut offspring;
-        let mut parent1;
-        let mut parent2;
-        let mut parent;
-        let mut newfit;
-        let mut newind;
-        self.print_parms();
-        self.stats(0);
-        for gen in 1..GENERATIONS {
-            if self.fbestpop > -1e-5 {
-                println!("PROBLEM SOLVED");
-                std::process::exit(0);
-            }
-            for _ in 0..POPSIZE {
-                if self.rd.gen::<f64>() < CROSSOVER_PROB {
-                    parent1 = self.tournament(TSIZE);
-                    parent2 = self.tournament(TSIZE);
-                    newind = self.crossover(parent1, parent2);
-                } else {
-                    parent = self.tournament(TSIZE);
-                    newind = self.mutation(parent, PMUT_PER_NODE);
-                }
-                newfit = self.fitness_function(&newind);
-                offspring = self.negative_tournament(TSIZE);
-                self.pop[offspring] = newind;
-                self.fitness[offspring] = newfit;
-            }
-            self.stats(gen);
-        }
-        println!("PROBLEM *NOT* SOLVED");
-        std::process::exit(1);
     }
 
 }
